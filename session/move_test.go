@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -218,6 +219,8 @@ func TestSessionMove_StaleProposalIgnored_AndNewChannelJoinsCleanly(t *testing.T
 	}
 
 	// --- Channel A: Discord adds the bot to an existing group. ---
+	s.SetChannelID(100)
+	s.AddUser("987654321")
 	s.OnSelectProtocolAck(1)
 	externalSenderPackage := buildExternalSenderPackage(t)
 	setExternalSenderPackage(t, s, externalSenderPackage)
@@ -230,7 +233,7 @@ func TestSessionMove_StaleProposalIgnored_AndNewChannelJoinsCleanly(t *testing.T
 	if err != nil {
 		t.Fatalf("peer.FreshKeyPackageBytes(A): %v", err)
 	}
-	groupA, err := peer.CreateGroupWithExternalSender(ctx, []byte("group-A"), peerKP, externalSenderPackage)
+	groupA, err := peer.CreateGroupWithExternalSender(ctx, binary.BigEndian.AppendUint64(nil, 100), peerKP, externalSenderPackage)
 	if err != nil {
 		t.Fatalf("peer.CreateGroupWithExternalSender(A): %v", err)
 	}
@@ -253,6 +256,8 @@ func TestSessionMove_StaleProposalIgnored_AndNewChannelJoinsCleanly(t *testing.T
 	s.mu.RUnlock()
 
 	// --- The bot is moved to channel B. ---
+	s.SetChannelID(200)
+	s.AddUser("987654321")
 	s.OnSelectProtocolAck(1)
 	kpB := cb.lastKeyPackage()
 	if bytes.Equal(kpA, kpB) {
@@ -287,7 +292,7 @@ func TestSessionMove_StaleProposalIgnored_AndNewChannelJoinsCleanly(t *testing.T
 	if err != nil {
 		t.Fatalf("peer.FreshKeyPackageBytes(B): %v", err)
 	}
-	groupB, err := peer.CreateGroupWithExternalSender(ctx, []byte("group-B"), peerKP, externalSenderPackage)
+	groupB, err := peer.CreateGroupWithExternalSender(ctx, binary.BigEndian.AppendUint64(nil, 200), peerKP, externalSenderPackage)
 	if err != nil {
 		t.Fatalf("peer.CreateGroupWithExternalSender(B): %v", err)
 	}
@@ -397,8 +402,8 @@ func TestOnSelectProtocolAck_V0AfterMoveDropsSendKey(t *testing.T) {
 	if err != nil || !bytes.Equal(out[:n], plaintext) {
 		t.Fatalf("Encrypt after the move = %x, %v; want the frame passed through", out[:n], err)
 	}
-	if got := s.State(); got != (State{}) {
-		t.Errorf("State() = %+v, want the zero State of a fresh version 0 session", got)
+	if got := s.State(); got.Ready || got.ProtocolVersion != 0 || got.HasKeyPackage || got.HasGroup || got.HasPendingEpoch || got.HasPendingCommit {
+		t.Errorf("State() = %+v, want transport-only state without MLS group", got)
 	}
 	if !s.Ready() {
 		t.Error("Ready() = false, want true at version 0")

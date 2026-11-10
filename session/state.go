@@ -7,6 +7,12 @@ import (
 
 // State is a snapshot of the session's ability to encrypt media.
 type State struct {
+	// Handshake progress flags contain no MLS payloads or key material.
+	HasKeyPackage     bool
+	HasExternalSender bool
+	HasGroup          bool
+	HasPendingEpoch   bool
+	HasPendingCommit  bool
 	// EpochID is the active MLS epoch, 0 when none is active.
 	EpochID uint64
 	// Ready reports whether frames are currently end-to-end encrypted. It is
@@ -31,10 +37,12 @@ type State struct {
 
 // Stats are cumulative counters since the session was created.
 type Stats struct {
-	CommitsProcessed uint64
-	CommitsFailed    uint64
-	WelcomesJoined   uint64
-	WelcomesFailed   uint64
+	KeyPackagesSent        uint64
+	KeyPackageSendFailures uint64
+	CommitsProcessed       uint64
+	CommitsFailed          uint64
+	WelcomesJoined         uint64
+	WelcomesFailed         uint64
 	// WelcomePanics counts the Welcomes, out of WelcomesFailed, that made
 	// mls-go panic. The session recovers and rejoins, but any non-zero value
 	// is an mls-go bug worth reporting with the logged stack.
@@ -61,20 +69,11 @@ type Stats struct {
 	// PassthroughFrames counts frames forwarded unmodified because no E2EE epoch
 	// was active (sole member before activation, or a protocol-version-0 session).
 	PassthroughFrames uint64
-	// TransitionFrames counts frames encrypted with the retained (previous) send
-	// ratchet during the post-activation transition window. Non-zero means the
-	// session activated a new epoch and the receiver might still be on the
-	// previous one. Useful for observability and to confirm the
-	// post-activation bridge is doing its job in production.
+	// TransitionFrames counts frames sent through the legacy reset bridge.
+	// Executed epochs never use the previous send ratchet.
 	TransitionFrames uint64
-	// TransitionWindows counts distinct post-activation retention windows
-	// entered by this session (one per epoch activation that had a previous send
-	// ratchet to retain). Complements TransitionFrames: the retention TTL is a
-	// fixed constant (sendRetentionTTL), so "total time in transition" would be
-	// TransitionWindows * sendRetentionTTL — redundant. A window with zero
-	// TransitionFrames is still informative (epoch activated without any frame
-	// emitted in the gap); a window with many TransitionFrames confirms jitter
-	// on execute_transition delivery.
+	// TransitionWindows is retained for API compatibility; execute no longer
+	// creates send-retention windows.
 	TransitionWindows uint64
 	// DegradedDuration accumulates time spent in degraded state (no active
 	// E2EE epoch) across all recovery cycles that ended in
@@ -120,9 +119,14 @@ func (s *Session) State() State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	st := State{
-		Ready:           s.activeEpoch != nil && s.sendRatchet != nil,
-		DegradedSince:   s.degradedSince,
-		ProtocolVersion: s.protocolVersion,
+		HasKeyPackage:     len(s.pendingKeyPackage) > 0,
+		HasExternalSender: len(s.externalSenderPackage) > 0,
+		HasGroup:          len(s.groupID) > 0,
+		HasPendingEpoch:   s.pendingEpoch != nil,
+		HasPendingCommit:  len(s.pendingCommitBytes) > 0,
+		Ready:             s.activeEpoch != nil && s.sendRatchet != nil,
+		DegradedSince:     s.degradedSince,
+		ProtocolVersion:   s.protocolVersion,
 	}
 	if s.activeEpoch != nil {
 		st.EpochID = s.activeEpoch.id

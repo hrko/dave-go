@@ -87,29 +87,8 @@ type Session struct {
 	sendCounter *mediakeys.NonceCounter
 	sendRatchet *mediakeys.KeyRatchet
 
-	// retainedSendRatchet holds the previous sendRatchet across an epoch
-	// transition so the sender keeps producing frames the receiver can still
-	// decrypt for up to sendRetentionTTL after the new epoch activates.
-	//
-	// NOTE: this is a deliberate extension beyond the literal protocol text,
-	// not a spec requirement. protocol.md only mandates retention on the
-	// RECEIVE side ("Media receivers temporarily retain the sender key
-	// ratchets for previous epochs... up to ten seconds") and is explicit
-	// that the SEND side switches atomically: "Upon receipt of [execute_
-	// transition], media senders begin using the new... key ratchet" and
-	// "media senders will continue to use key ratchets from the previous
-	// epoch UNTIL the transition is executed" (i.e. not after). By spec
-	// design every member should already have the new receive ratchet
-	// derived (right after processing the commit, before ready_for_
-	// transition is even sent) before any sender could use it, so this
-	// padding exists purely as defense against real-world delivery jitter
-	// on execute_transition across members, not because the protocol asks
-	// for it.
-	//
-	// Cleared lazily by selectSendRatchetLocked when the TTL elapses; that
-	// call also resets sendCounter so the new ratchet starts from nonce 0
-	// per spec ("When a key ratchet is generated for a new epoch, the
-	// sender resets their nonce to 0").
+	// Retained send keys bridge a reset only until a new epoch executes.
+	// Execute always clears them; post-execute retention is receive-side only.
 	retainedSendRatchet   *mediakeys.KeyRatchet
 	retainedSendExpiresAt time.Time
 	sendRetentionTTL      time.Duration
@@ -392,15 +371,8 @@ func (s *Session) resetEpochReadyLocked() {
 	s.epochReady = make(chan struct{})
 }
 
-// selectSendRatchetLocked returns the ratchet to use for the next Encrypt
-// frame. During the transition window (between a new epoch activating and
-// sendRetentionTTL elapsing), the previous (retained) ratchet is used so
-// receivers that haven't yet caught up to the new commit can still decrypt
-// frames the sender emits during the gap — see the retainedSendRatchet field
-// doc for why this is a defensive extension beyond the literal protocol text,
-// not a spec requirement. When the retained ratchet expires, this resets
-// sendCounter (so the new ratchet starts from nonce 0 per spec) and returns
-// the new ratchet. Must be called with s.mu held.
+// selectSendRatchetLocked selects the active or reset-bridging send key.
+// Executing an epoch clears the bridge before sending any new media.
 func (s *Session) selectSendRatchetLocked() *mediakeys.KeyRatchet {
 	if s.retainedSendRatchet != nil {
 		if time.Now().Before(s.retainedSendExpiresAt) {
@@ -731,11 +703,14 @@ func (s *Session) OnDavePrepareTransition(transitionID uint16, protocolVersion u
 		return
 	}
 
-	// Downgrade to v0 (protocol.md:124-125): no commit or welcome will arrive,
-	// so the normal op23 path (from OnDaveMLSPrepareCommitTransition /
-	// OnDaveMLSWelcome) never fires. Send ready_for_transition immediately.
-	if protocolVersion == 0 && s.callbacks != nil {
-		s.logger.Debug("downgrade to v0: sending ready_for_transition",
+	// A retained group can transition without a new Commit/Welcome. Only
+	// acknowledge an encrypted transition when receive keys are available.
+	if protocolVersion != 0 && s.pendingEpoch == nil && s.activeEpoch == nil {
+		s.logger.Warn("cannot prepare encrypted transition without an epoch", "transition_id", transitionID)
+		return
+	}
+	if s.callbacks != nil {
+		s.logger.Debug("sending ready_for_transition",
 			"transition_id", transitionID)
 		if err := s.sendLocked(func() error {
 			return s.callbacks.SendReadyForTransition(transitionID)
@@ -860,6 +835,22 @@ func (s *Session) OnDaveMLSProposals(proposals []byte) {
 		"group_id", fmt.Sprintf("%x", s.groupID),
 		"has_group", len(s.groupID) > 0)
 
+	// A locally proposed commit is speculative until the gateway echoes it.
+	// Revoke applies to its pre-commit cache, not the already merged local
+	// epoch. Do not roll back a gateway-confirmed commit or a joined Welcome.
+	if len(proposals) > 0 && proposals[0] == 1 && len(s.pendingCommitBytes) > 0 {
+		if _, err := parseRevokeReferences(proposals[1:]); err != nil {
+			s.logger.Error("invalid revoke batch", "error", err)
+			return
+		}
+		if err := s.restorePreCommitStateLocked(); err != nil {
+			s.logger.Error("failed to restore proposals for revoke", "error", err)
+			return
+		}
+		// Cancel the superseded commit watchdog, even if all proposals vanish.
+		s.resetEpochReadyLocked()
+	}
+
 	// If a pendingEpoch is already waiting for ExecuteTransition, queue this
 	// batch instead of committing immediately. Committing again would advance
 	// the local group state past what Discord DS has accepted, causing the
@@ -882,7 +873,7 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 
 		return
 	}
-	acceptedAny, err := s.processProposalBatchLocked(proposals)
+	_, err := s.processProposalBatchLocked(proposals)
 	if err != nil {
 		s.logger.Error("failed to process proposals", "error", err, "size", len(proposals))
 
@@ -893,19 +884,13 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 
 		return
 	}
-	// DAVE revoke (operation_type=1) solo quita proposals cacheados; la spec
-	// manda commitear "if there are one or more cached proposals after
-	// processing" (protocol.md:176) — un revoke puro no deja proposals nuevos.
-	if len(proposals) > 0 && proposals[0] == 1 {
-		s.logger.Info("mls revoke processed, no commit needed",
-			"size", len(proposals))
-
+	// Both append and revoke commit the proposals remaining in the cache.
+	pending, err := s.hasCachedProposalsLocked()
+	if err != nil {
+		s.logger.Error("failed to inspect cached proposals", "error", err)
 		return
 	}
-	if !acceptedAny {
-		s.logger.Info("mls proposals processed without accepted append proposals, skipping commit",
-			"size", len(proposals))
-
+	if !pending {
 		return
 	}
 	if err := s.commitProposalsLocked(); err != nil {

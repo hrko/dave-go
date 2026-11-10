@@ -45,23 +45,24 @@ func peerWithIdentity(t *testing.T, userID string) *mls.Client {
 	return peer
 }
 
-func newWelcomeForExternalSender(t *testing.T, botKP, externalSenderPackage []byte) (groupID, welcome []byte) {
+func newWelcomeForExternalSender(t *testing.T, s *Session, botKP, externalSenderPackage []byte) (groupID, welcome []byte) {
 	t.Helper()
-	_, groupID, welcome = newPeerGroupForExternalSender(t, botKP, externalSenderPackage)
+	_, groupID, welcome = newPeerGroupForExternalSender(t, s, botKP, externalSenderPackage)
 
 	return groupID, welcome
 }
 
-func newPeerGroupForExternalSender(t *testing.T, botKP, externalSenderPackage []byte) (peer *mls.Client, groupID, welcome []byte) {
+func newPeerGroupForExternalSender(t *testing.T, s *Session, botKP, externalSenderPackage []byte) (peer *mls.Client, groupID, welcome []byte) {
 	t.Helper()
 
 	ctx := context.Background()
 	peer = peerWithIdentity(t, "987654321")
+	s.AddUser("987654321")
 	peerKP, err := peer.FreshKeyPackageBytes(ctx)
 	if err != nil {
 		t.Fatalf("peer.FreshKeyPackageBytes: %v", err)
 	}
-	groupID, err = peer.CreateGroupWithExternalSender(ctx, []byte("12345678"), peerKP, externalSenderPackage)
+	groupID, err = peer.CreateGroupWithExternalSender(ctx, binary.BigEndian.AppendUint64(nil, uint64(s.channelID)), peerKP, externalSenderPackage)
 	if err != nil {
 		t.Fatalf("CreateGroupWithExternalSender: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestOnDaveMLSWelcome_ValidatesExternalSender(t *testing.T) {
 	externalSenderPackage := buildExternalSenderPackage(t)
 	setExternalSenderPackage(t, s, externalSenderPackage)
 
-	groupID, welcome := newWelcomeForExternalSender(t, botKP, externalSenderPackage)
+	groupID, welcome := newWelcomeForExternalSender(t, s, botKP, externalSenderPackage)
 	if len(groupID) == 0 || len(welcome) == 0 {
 		t.Fatal("test setup produced empty groupID/welcome")
 	}
@@ -127,7 +128,7 @@ func TestOnDaveMLSWelcome_RejectsMismatchedExternalSender(t *testing.T) {
 	}
 	setExternalSenderPackage(t, s, storedPackage)
 
-	_, welcome := newWelcomeForExternalSender(t, botKP, groupPackage)
+	_, welcome := newWelcomeForExternalSender(t, s, botKP, groupPackage)
 	s.OnDaveMLSWelcome(0, welcome)
 
 	if got := s.Stats().WelcomesFailed; got != 1 {
@@ -182,7 +183,7 @@ func TestOnDaveMLSWelcome_OverPeerPendingEpoch(t *testing.T) {
 			externalSenderPackage := buildExternalSenderPackage(t)
 			setExternalSenderPackage(t, s, externalSenderPackage)
 			botKP := cb.lastKeyPackage()
-			peer, groupID, welcome := newPeerGroupForExternalSender(t, botKP, externalSenderPackage)
+			peer, groupID, welcome := newPeerGroupForExternalSender(t, s, botKP, externalSenderPackage)
 			s.OnDaveMLSWelcome(tt.welcomeTransitionID, welcome)
 			transitionID := tt.welcomeTransitionID
 			if tt.peerCommit {
@@ -200,7 +201,7 @@ func TestOnDaveMLSWelcome_OverPeerPendingEpoch(t *testing.T) {
 				t.Fatal("test setup left no pending epoch")
 			}
 
-			_, _, newWelcome := newPeerGroupForExternalSender(t, botKP, externalSenderPackage)
+			_, _, newWelcome := newPeerGroupForExternalSender(t, s, botKP, externalSenderPackage)
 			s.OnDaveMLSWelcome(transitionID+1, newWelcome)
 
 			stats := s.Stats()
@@ -245,7 +246,7 @@ func TestOnDaveMLSWelcome_AfterOwnCommit(t *testing.T) {
 		t.Fatalf("committed = %v with %d queued batches, want a commit and 1 queued batch", committed, queued)
 	}
 
-	peer, groupID, welcome := newPeerGroupForExternalSender(t, botKP, externalSenderPackage)
+	peer, groupID, welcome := newPeerGroupForExternalSender(t, s, botKP, externalSenderPackage)
 	s.OnDaveMLSWelcome(1, welcome)
 
 	stats := s.Stats()
@@ -294,7 +295,7 @@ func TestOnDaveMLSWelcome_RejectsUnsupportedCipherSuite(t *testing.T) {
 			externalSenderPackage := buildExternalSenderPackage(t)
 			setExternalSenderPackage(t, s, externalSenderPackage)
 			botKP := cb.lastKeyPackage()
-			_, welcome := newWelcomeForExternalSender(t, botKP, externalSenderPackage)
+			_, welcome := newWelcomeForExternalSender(t, s, botKP, externalSenderPackage)
 			welcome = withWelcomeCipherSuite(t, welcome, tt.suite, tt.wrapped)
 
 			func() {
@@ -332,7 +333,7 @@ func TestJoinGroup_RecoversMLSPanic(t *testing.T) {
 	s.OnSelectProtocolAck(1)
 	externalSenderPackage := buildExternalSenderPackage(t)
 	setExternalSenderPackage(t, s, externalSenderPackage)
-	_, welcome := newWelcomeForExternalSender(t, cb.lastKeyPackage(), externalSenderPackage)
+	_, welcome := newWelcomeForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
 	welcome = withWelcomeCipherSuite(t, welcome, 0x0080, false)
 
 	s.lockMLS()

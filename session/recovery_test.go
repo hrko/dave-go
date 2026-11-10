@@ -305,7 +305,7 @@ func TestReadyForTransitionDropped_ArmsRecoveryWithoutActiveEpoch(t *testing.T) 
 			s.OnSelectProtocolAck(1)
 			externalSenderPackage := buildExternalSenderPackage(t)
 			setExternalSenderPackage(t, s, externalSenderPackage)
-			peer, groupID, welcome := newPeerGroupForExternalSender(t, cb.lastKeyPackage(), externalSenderPackage)
+			peer, groupID, welcome := newPeerGroupForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
 			s.OnDaveMLSWelcome(tt.welcomeTransitionID, welcome)
 			if tt.peerCommit {
 				commit, _, err := peer.CommitPendingProposals(context.Background(), groupID)

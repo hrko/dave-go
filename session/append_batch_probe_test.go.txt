@@ -1,0 +1,17 @@
+package session
+
+import "testing"
+
+// Pending mls-go streaming-decoder regression. Copy to a *_test.go file to run;
+// expected to fail on mls-go v1.6.0 with "unable to locate raw handshake body".
+func TestConcatenatedAppendBatch(t *testing.T) {
+ s,key:=setupActiveSoleMemberSessionWithKey(t)
+ defer s.Close()
+ cb:=&commitCountingCallbacks{}
+ s.callbacks=cb
+ s.AddUser("222"); s.AddUser("333")
+ first:=addProposalBytesForUser(t,s,key,"222")
+ second:=addProposalBytesForUser(t,s,key,"333")
+ s.OnDaveMLSProposals(buildProposalBatch(append(first,second...)))
+ if cb.commits!=1 {t.Fatalf("commits=%d, want 1",cb.commits)}
+}

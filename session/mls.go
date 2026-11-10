@@ -158,8 +158,10 @@ func (s *Session) sendKeyPackageLocked(kp []byte) error {
 	if s.callbacks != nil {
 		// libdave sends the marshaled KeyPackage directly for opcode 26.
 		if err := s.sendLocked(func() error { return s.callbacks.SendMLSKeyPackage(kp) }); err != nil {
+			s.stats.KeyPackageSendFailures++
 			return fmt.Errorf("send mls key package: %w", err)
 		}
+		s.stats.KeyPackagesSent++
 	}
 	s.pendingKeyPackage = append([]byte(nil), kp...)
 
@@ -181,6 +183,24 @@ func (s *Session) joinPendingWelcomeLocked(welcome []byte) error {
 	}
 	if valErr := s.validateJoinedWelcomeExternalSenderLocked(groupID); valErr != nil {
 		return valErr
+	}
+	expectedGroupID := make([]byte, 8)
+	binary.BigEndian.PutUint64(expectedGroupID, uint64(s.channelID))
+	if s.channelID == 0 || !bytes.Equal(groupID, expectedGroupID) {
+		return fmt.Errorf("welcome group does not match voice channel")
+	}
+	members, err := s.mlsClient.client.ListMembers(context.Background(), groupID)
+	if err != nil {
+		return fmt.Errorf("list welcome members: %w", err)
+	}
+	for _, member := range members {
+		id, _, err := identityBytesToUserID(member.Identity)
+		if err != nil {
+			return fmt.Errorf("decode welcome member: %w", err)
+		}
+		if _, recognized := s.users[id]; id != s.userID && !recognized {
+			return fmt.Errorf("welcome contains unrecognized member")
+		}
 	}
 
 	// Update groupID immediately so that processCommitLocked and
@@ -773,7 +793,6 @@ func (s *Session) activatePendingEpochLocked() {
 		return
 	}
 
-	oldActive := s.activeEpoch
 	if s.activeEpoch != nil {
 		s.activeEpoch.expiresAt = time.Now().Add(epochRetention)
 		s.retainedEpoch = append(s.retainedEpoch, s.activeEpoch)
@@ -788,36 +807,25 @@ func (s *Session) activatePendingEpochLocked() {
 	}
 	s.groupID = append([]byte(nil), s.pendingGroupID...)
 	s.pendingGroupID = nil
-	// activatePendingEpochLocked runs from OnDaveExecuteTransition (opcode 22)
-	// — the exact moment protocol.md says "media senders begin using the
-	// new... key ratchet" immediately, with no grace period on the send side
-	// (retention there is receive-side only, see retainedSendRatchet field
-	// doc in session.go). Retaining the previous send ratchet is a deliberate
-	// extension beyond that literal text: defensive padding against
-	// execute_transition delivery jitter for receivers that were ALSO in the
-	// previous epoch.
-	//
-	// But when the new epoch ADDED a member (a join), that member was never in
-	// the previous epoch and holds none of its keys — so retaining the old send
-	// ratchet would black out their audio for the entire TTL (~10s), which is
-	// exactly the "no audio for ~10s after re-join" symptom. In that case switch
-	// atomically (spec-compliant) and reset the nonce to 0 so the new epoch's
-	// ratchet starts clean; selectSendRatchetLocked normally does that reset
-	// when the retained ratchet expires, so we must do it here when we skip
-	// retention.
-	if s.sendRatchet != nil {
-		if newEpochAddsSender(oldActive, s.activeEpoch) {
-			s.sendCounter.Reset()
-			s.retainedSendRatchet = nil
-			s.retainedSendExpiresAt = time.Time{}
-		} else {
-			s.retainedSendRatchet = s.sendRatchet
-			s.retainedSendExpiresAt = time.Now().Add(s.sendRetentionTTL)
-			s.stats.TransitionWindows++
-		}
+	// Execute switches sending immediately. Retention is receive-side only.
+	// Compare at the old ratchet's current generation: generation zero may
+	// already have been erased. Never reset the counter for the same key.
+	previous := s.sendRatchet
+	if s.retainedSendRatchet != nil {
+		previous = s.retainedSendRatchet
 	}
+	s.retainedSendRatchet = nil
+	s.retainedSendExpiresAt = time.Time{}
 
 	if sender := s.activeEpoch.senders[s.userID]; sender != nil {
+		if previous != nil {
+			generation := previous.CurrentGeneration()
+			oldKey, oldErr := previous.GetKey(generation)
+			newKey, newErr := sender.ratchet.GetKey(generation)
+			if oldErr == nil && newErr == nil && !bytes.Equal(oldKey, newKey) {
+				s.sendCounter.Reset()
+			}
+		}
 		s.sendRatchet = sender.ratchet
 		s.recoveryAttempts = 0
 		s.markRecoveredLocked(s.activeEpoch.id)
@@ -838,25 +846,6 @@ func (s *Session) activatePendingEpochLocked() {
 	// activated. Process them one at a time so that each commit can be
 	// queued again if another pending epoch accumulates mid-drain.
 	s.drainProposalQueueLocked()
-}
-
-// newEpochAddsSender reports whether newEpoch contains a member (sender) that
-// was not present in oldEpoch. When it does, retaining the previous send
-// ratchet across the transition would black out the newly-joined member's audio
-// for the full retention TTL: they were never in the old epoch, so they hold
-// none of its keys and cannot decrypt frames the bot keeps sending on the
-// retained ratchet. Treats a nil old epoch as "added" (nothing to retain for).
-func newEpochAddsSender(oldEpoch, newEpoch *epochState) bool {
-	if oldEpoch == nil || newEpoch == nil {
-		return true
-	}
-	for userID := range newEpoch.senders {
-		if _, ok := oldEpoch.senders[userID]; !ok {
-			return true
-		}
-	}
-
-	return false
 }
 
 func (s *Session) drainProposalQueueLocked() {
@@ -1204,6 +1193,18 @@ func (s *Session) commitProposalsLocked() error {
 	return nil
 }
 
+func (s *Session) hasCachedProposalsLocked() (bool, error) {
+	state, err := s.mlsClient.store.LoadGroupState(context.Background(), group.NewGroupID(s.groupID))
+	if err != nil {
+		return false, err
+	}
+	g, err := group.UnmarshalGroupState(state)
+	if err != nil {
+		return false, err
+	}
+	return len(g.StoredProposals()) > 0, nil
+}
+
 // proposalRefSize is the length of an MLS ProposalRef (HashReference<V>) for
 // the ciphersuite DAVE requires: MLS128DHKEMP256 -> SHA-256 -> 32 bytes.
 // Confirmed against mls-go/ciphersuite/hash_ref.go + coverage_test.go:59.
@@ -1218,44 +1219,39 @@ const maxRevokeRefs = 256
 // Delegates to mls.Client.RevokeProposals, which removes the proposals from
 // the local pending store and proposalByRef lookup; idempotent.
 func (s *Session) processRevokeProposalsLocked(payload []byte) error {
+	refs, err := parseRevokeReferences(payload)
+	if err != nil || len(refs) == 0 {
+		return err
+	}
+	if err := s.mlsClient.client.RevokeProposals(context.Background(), s.groupID, refs); err != nil {
+		return fmt.Errorf("revoke proposals: %w", err)
+	}
+	s.logger.Debug("revoke applied", "ref_count", len(refs))
+	return nil
+}
+
+func parseRevokeReferences(payload []byte) ([][]byte, error) {
 	vecLen, headerSize, err := readTLSVectorLength(payload)
 	if err != nil {
-		return fmt.Errorf("reading revoke vector length: %w", err)
+		return nil, fmt.Errorf("reading revoke vector length: %w", err)
 	}
 	end := headerSize + int(vecLen)
-	if end > len(payload) {
-		return fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
+	if end != len(payload) {
+		return nil, fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
 	}
 
 	body := payload[headerSize:end]
-	if len(body) == 0 {
-		s.logger.Debug("processRevokeProposalsLocked: revoke batch empty")
-
-		return nil
+	var refs [][]byte
+	for len(body) > 0 {
+		if len(refs) >= maxRevokeRefs {
+			return nil, fmt.Errorf("%w: revoke reference limit", ErrProposalsTooMany)
+		}
+		n, header, err := readTLSVectorLength(body)
+		if err != nil || n != proposalRefSize || header+int(n) > len(body) {
+			return nil, fmt.Errorf("%w: invalid revoke reference", ErrProposalsTruncated)
+		}
+		refs = append(refs, append([]byte(nil), body[header:header+int(n)]...))
+		body = body[header+int(n):]
 	}
-	if len(body)%proposalRefSize != 0 {
-		return fmt.Errorf("%w: revoke body %d bytes not multiple of %d",
-			ErrProposalsTruncated, len(body), proposalRefSize)
-	}
-
-	n := len(body) / proposalRefSize
-	if n > maxRevokeRefs {
-		return fmt.Errorf("%w: %d refs exceeds %d", ErrProposalsTooMany, n, maxRevokeRefs)
-	}
-	refs := make([][]byte, 0, n)
-	for i := 0; i < len(body); i += proposalRefSize {
-		refs = append(refs, append([]byte(nil), body[i:i+proposalRefSize]...))
-	}
-	s.logger.Debug("processProposalBatchLocked: revoke",
-		"ref_count", len(refs),
-		"first_ref", fmt.Sprintf("%x", refs[0][:minInt(16, len(refs[0]))]))
-	if err := s.mlsClient.client.RevokeProposals(
-		context.Background(), s.groupID, refs,
-	); err != nil {
-		return fmt.Errorf("revoke proposals: %w", err)
-	}
-	s.logger.Debug("processProposalBatchLocked: revoke applied",
-		"ref_count", len(refs))
-
-	return nil
+	return refs, nil
 }

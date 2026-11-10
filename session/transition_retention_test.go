@@ -79,11 +79,8 @@ func TestActivate_SkipsSendRetentionOnJoin(t *testing.T) {
 	}
 }
 
-// TestActivate_RetainsSendRatchetWhenNoJoin: when the new epoch does not add a
-// member (same membership, or a removal), retention is preserved — every
-// receiver was in the old epoch and can still decrypt the retained frames,
-// bridging execute_transition jitter.
-func TestActivate_RetainsSendRatchetWhenNoJoin(t *testing.T) {
+// Executing a transition never retains the old send key, including removals.
+func TestActivate_DropsOldSendRatchetWhenNoJoin(t *testing.T) {
 	t.Run("same members", func(t *testing.T) {
 		s := setupForActivation(t, []godave.UserID{"bot", "other"}, []godave.UserID{"bot", "other"})
 
@@ -93,11 +90,11 @@ func TestActivate_RetainsSendRatchetWhenNoJoin(t *testing.T) {
 		windows := s.stats.TransitionWindows
 		s.mu.Unlock()
 
-		if retained == nil {
-			t.Error("send ratchet should be retained when membership is unchanged")
+		if retained != nil {
+			t.Error("send ratchet should not be retained when membership is unchanged")
 		}
-		if windows != 1 {
-			t.Errorf("TransitionWindows = %d, want 1", windows)
+		if windows != 0 {
+			t.Errorf("TransitionWindows = %d, want 0", windows)
 		}
 	})
 
@@ -109,8 +106,18 @@ func TestActivate_RetainsSendRatchetWhenNoJoin(t *testing.T) {
 		retained := s.retainedSendRatchet
 		s.mu.Unlock()
 
-		if retained == nil {
-			t.Error("send ratchet should be retained on a removal (new members ⊆ old)")
+		if retained != nil {
+			t.Error("send ratchet should not be retained on a removal")
 		}
 	})
+}
+
+func TestActivate_SameKeyPreservesCounter(t *testing.T) {
+	s := setupForActivation(t, []godave.UserID{"bot"}, []godave.UserID{"bot"})
+	defer s.Close()
+	s.pendingEpoch.senders["bot"].ratchet = newRatchet(t, 0x01)
+	s.activatePendingEpochLocked()
+	if n := s.sendCounter.Current(); n != 5 {
+		t.Fatalf("same-key activation reset nonce counter: got %d, want 5", n)
+	}
 }

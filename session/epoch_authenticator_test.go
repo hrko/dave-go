@@ -41,7 +41,7 @@ func TestEpochAuthenticator_RequiresActivation(t *testing.T) {
 			t.Helper()
 			externalSenderPackage := buildExternalSenderPackage(t)
 			s.OnDaveMLSExternalSenderPackage(externalSenderPackage)
-			_, welcome := newWelcomeForExternalSender(t, cb.lastKeyPackage(), externalSenderPackage)
+			_, welcome := newWelcomeForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
 			s.OnDaveMLSWelcome(welcomeTransitionID, welcome)
 
 			return func() { s.OnDaveExecuteTransition(welcomeTransitionID) }

@@ -116,7 +116,7 @@ func TestDebugLogsCarryNoKeyMaterial(t *testing.T) {
 	s.OnSelectProtocolAck(1)
 	externalSenderPackage := buildExternalSenderPackage(t)
 	s.OnDaveMLSExternalSenderPackage(externalSenderPackage)
-	_, welcome := newWelcomeForExternalSender(t, cb.lastKeyPackage(), externalSenderPackage)
+	_, welcome := newWelcomeForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
 	// The peer that built the Welcome logs through slog.Default; only the bot's
 	// own lines are under test.
 	defaultLogs.Reset()

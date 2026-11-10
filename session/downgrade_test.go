@@ -213,17 +213,15 @@ func TestDowngradeV0_StatsIncrement(t *testing.T) {
 	}
 }
 
-// TestUpgrade_NoDowngradeBehavior verifies that OnDavePrepareTransition with
-// protocolVersion > 0 does NOT send ready_for_transition (the commit/welcome
-// flow handles it).
-func TestUpgrade_NoDowngradeBehavior(t *testing.T) {
+// An encrypted transition with an existing group also needs an acknowledgement.
+func TestUpgrade_AcknowledgesPreparedGroup(t *testing.T) {
 	s, cb := newDowngradeTestSession(t)
 
 	s.OnDavePrepareTransition(10, 1)
 
 	ids := cb.readyTransitionIDs()
-	if len(ids) != 0 {
-		t.Fatalf("expected no ready_for_transition for upgrade, got %v", ids)
+	if len(ids) != 1 || ids[0] != 10 {
+		t.Fatalf("expected ready_for_transition(10), got %v", ids)
 	}
 }
 

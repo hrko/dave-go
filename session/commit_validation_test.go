@@ -149,7 +149,7 @@ func TestOnDaveMLSPrepareCommitTransition_OverPendingEpoch(t *testing.T) {
 			s.OnSelectProtocolAck(1)
 			externalSenderPackage, extPriv := buildExternalSenderPackageWithKey(t)
 			setExternalSenderPackage(t, s, externalSenderPackage)
-			peer, groupID, welcome := newPeerGroupForExternalSender(t, cb.lastKeyPackage(), externalSenderPackage)
+			peer, groupID, welcome := newPeerGroupForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
 			s.OnDaveMLSWelcome(tt.welcomeTransitionID, welcome)
 
 			peerCommit := func() []byte {

@@ -10,7 +10,13 @@ import (
 // uint8(1) || TLSVector<ProposalRef[32 bytes]>. The wire format is documented in
 // protocol.md:1020-1048.
 func buildRevokeBatch(refs []byte) []byte {
-	return append([]byte{0x01}, writeVLBytes(refs)...)
+	var body []byte
+	for len(refs) > 0 {
+		n := min(len(refs), proposalRefSize)
+		body = append(body, writeVLBytes(refs[:n])...)
+		refs = refs[n:]
+	}
+	return append([]byte{0x01}, writeVLBytes(body)...)
 }
 
 // TestProcessRevokeProposalsLocked_WireFormat covers the parsing of the revoke
@@ -42,7 +48,7 @@ func TestProcessRevokeProposalsLocked_WireFormat(t *testing.T) {
 		{"empty refs batch", buildRevokeBatch(nil), ""},
 		{"one valid ref 32 bytes", buildRevokeBatch(make([]byte, 32)), "revoke proposals:"},
 		{"two valid refs 64 bytes", buildRevokeBatch(make([]byte, 64)), "revoke proposals:"},
-		{"bad body len not multiple of 32", buildRevokeBatch(make([]byte, 33)), "not multiple of 32"},
+		{"short reference", buildRevokeBatch(make([]byte, 33)), "invalid revoke reference"},
 		{"truncated vector", []byte{0x01, 0x20}, "truncated"},
 		{"too many refs exceeds maxRevokeRefs", buildRevokeBatch(make([]byte, maxRevokeRefs*32+32)), "too many"},
 	}
