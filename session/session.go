@@ -863,11 +863,18 @@ func (s *Session) OnDaveMLSProposals(proposals []byte) {
 	}
 
 	s.processAndCommitProposalBatchLocked(proposals)
+	// Revoking every cached proposal can remove the pending epoch entirely.
+	// Previously queued append batches must not wait for an execute that will
+	// never arrive for that discarded local commit.
+	s.drainProposalQueueLocked()
 }
 
 // processAndCommitProposalBatchLocked processes a proposal batch and commits.
 // Must be called with s.mu held.
 func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
+	if len(proposals) == 0 || proposals[0] > 1 {
+		return
+	}
 	if err := s.ensureMLSClientLocked(); err != nil {
 		s.logger.Error("failed to init mls client", "error", err)
 

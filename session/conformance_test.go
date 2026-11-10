@@ -103,6 +103,51 @@ func TestRevokeMalformedDoesNotAlterPendingCommit(t *testing.T) {
 	}
 }
 
+func TestRevokeAllDrainsQueuedAppend(t *testing.T) {
+	s, key := setupActiveSoleMemberSessionWithKey(t)
+	defer s.Close()
+	cb := &commitCountingCallbacks{}
+	s.callbacks = cb
+	s.AddUser("222")
+	s.AddUser("333")
+	first := addProposalBytesForUser(t, s, key, "222")
+	second := addProposalBytesForUser(t, s, key, "333")
+	s.OnDaveMLSProposals(buildProposalBatch(first))
+	snapshot, err := group.UnmarshalGroupState(s.preCommitGroupState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.OnDaveMLSProposals(buildProposalBatch(second))
+	if len(s.proposalQueue) != 1 {
+		t.Fatal("fixture did not queue second proposal")
+	}
+	s.OnDaveMLSProposals(buildRevokeBatch(snapshot.StoredProposals()[0].Ref))
+	if cb.commits != 2 || len(s.proposalQueue) != 0 || s.pendingEpoch == nil {
+		t.Fatal("queued append stranded after revoke")
+	}
+	if _, revoked := s.pendingEpoch.senders["222"]; revoked {
+		t.Fatal("revoked user survived")
+	}
+	if _, added := s.pendingEpoch.senders["333"]; !added {
+		t.Fatal("queued user missing")
+	}
+}
+
+func TestUnknownProposalOperationDoesNotCommitCache(t *testing.T) {
+	s, key := setupActiveSoleMemberSessionWithKey(t)
+	defer s.Close()
+	cb := &commitCountingCallbacks{}
+	s.callbacks = cb
+	s.AddUser("222")
+	if _, err := s.processProposalBatchLocked(buildProposalBatch(addProposalBytesForUser(t, s, key, "222"))); err != nil {
+		t.Fatal(err)
+	}
+	s.OnDaveMLSProposals([]byte{2, 0})
+	if cb.commits != 0 {
+		t.Fatal("unknown operation committed cache")
+	}
+}
+
 func TestHandshakeProgress(t *testing.T) {
 	s := New("123456789", reviewFailedKeyPackage{})
 	defer s.Close()
