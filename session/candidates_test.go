@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"github.com/thomas-vilte/mls-go/ciphersuite"
 	"github.com/thomas-vilte/mls-go/framing"
 	"github.com/thomas-vilte/mls-go/group"
 	"testing"
@@ -113,5 +114,52 @@ func TestCandidateDoesNotSendDisconnectedCachedAdd(t *testing.T) {
 	}
 	if len(s.commitCandidates) != 1 || !bytes.Equal(before, s.pendingCommitBytes) {
 		t.Fatal("failed preparation changed candidates")
+	}
+}
+
+func TestDuplicateRemoveBatchIsAtomic(t *testing.T) {
+	s, key := setupActiveSoleMemberSessionWithKey(t)
+	s.AddUser("222")
+	s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, key, "222")))
+	confirmLatestCandidate(t, s)
+	s.OnDaveExecuteTransition(42)
+	state, err := group.UnmarshalGroupState(currentGroupBytes(t, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm, err := framing.NewPublicMessage(framing.FramedContent{
+		GroupID: s.groupID, Epoch: state.Epoch().AsUint64(), Sender: framing.Sender{Type: framing.SenderTypeExternal, SenderIndex: 0},
+		Body: framing.ProposalBody{Data: group.ProposalMarshal(group.NewRemoveProposal(1))},
+	}, ciphersuite.NewSignaturePrivateKey(key), nil, nil, state.CipherSuite())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := framing.NewMLSMessagePublic(pm).Marshal()
+	before := currentGroupBytes(t, s)
+	if _, err = s.processProposalBatchLocked(buildProposalBatch(append(append([]byte(nil), wire...), wire...))); err == nil {
+		t.Fatal("duplicate Remove accepted")
+	}
+	if !bytes.Equal(before, currentGroupBytes(t, s)) {
+		t.Fatal("duplicate Remove partially updated state")
+	}
+	if _, err = s.processProposalBatchLocked(buildProposalBatch(wire)); err != nil {
+		t.Fatalf("valid Remove rejected: %v", err)
+	}
+	state, err = group.UnmarshalGroupState(currentGroupBytes(t, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.StoredProposals()) != 1 {
+		t.Fatal("unexpected Remove cache")
+	}
+	if err = s.processRevokeProposalsLocked(buildRevokeBatch(state.StoredProposals()[0].Ref)[1:]); err != nil {
+		t.Fatal(err)
+	}
+	state, err = group.UnmarshalGroupState(currentGroupBytes(t, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.StoredProposals()) != 0 {
+		t.Fatal("revoked duplicate Remove survived")
 	}
 }

@@ -65,7 +65,7 @@ Reference: libdave `b5463c443df74db75a713c775b09a847621e6d62`, especially
 `cpp/src/session.cpp` ProcessProposals/ProcessCommit/SetExternalSender and media
 encryptor/decryptor transitions; https://daveprotocol.com/ MLS and media flows.
 Binary interoperability separately uses official **1.1.0/cpp**, not that source
-revision. Status of all entries: fork-only, no upstream PR, deployment pending.
+revision. Status of all entries: fork-only, no upstream PR. Runtime revision 91c784a is deployed; the user confirmed audio across a VC round trip.
 On upstream updates classify every ID as retained, replaced or removed. Record
 the upstream and removal commits and rerun the listed regressions. A clean merge
 alone is not evidence that a delta can be removed.
@@ -74,7 +74,7 @@ alone is not evidence that a delta can be removed.
 | --- | --- | --- |
 | DAVE-CANDIDATES-01 | `candidates.go`, `mls.go`, `session.go`, `close.go`: separate confirmed MLS, cached proposals, outbound candidates and media activation. Generation does not advance the group. Keep at most 16 candidates, evict oldest as libdave does; reset/adoption/Welcome/Close dispose them. Existing recovery watchdog bounds stalled handshakes. Requires MLS-CANDIDATE-01. | Candidate isolation, competing Commit, bounded queue, send failure and Close tests. Remove when upstream can select isolated Commit/Welcome candidates without speculative live-state changes and these tests pass. |
 | DAVE-PROPOSALS-01 | `mls.go`: deterministic Proposal prefix parsing, complete batch validation, exact Revoke vectors, unknown/duplicate rejection; revoked proposals cannot revive. Requires MLS-PREFIX-01 and MLS-BATCH-01. Atomic validation follows libdave; it is not a claim about mandatory durable transactions. | Append/revoke/conformance and valid-prefix-invalid-signature tests. Remove when upstream preserves the cached set on every rejected batch and passes split/partial/full-revoke tests. |
-| DAVE-COMMIT-01 | `commit_coverage.go`, `mls.go`: exact nonempty reference coverage; reject inline/unknown/repeated references, recheck Add recipients before generation and adoption, reject foreign Commit before establishment, require unchanged committer credential/signature key. Welcome validates channel and participants. Includes libdave client defenses beyond MLS authentication. | Candidate boundaries, disconnected Add, Commit and Welcome validation. `TestSignedCredentialChangingCommit` proves MLS accepts a correctly signed credential change while DAVE rejects it before adoption. Signature-key rotation is checked structurally; a fully signed rotation fixture remains pending. Remove only when upstream has equivalent checks and authenticated regressions pass. |
+| DAVE-COMMIT-01 | `commit_coverage.go`, `mls.go`: exact nonempty reference coverage; reject inline/unknown/repeated references, recheck Add recipients before generation and adoption, reject foreign Commit before establishment, require unchanged committer credential/signature key. Welcome validates channel and participants. Includes libdave client defenses beyond MLS authentication. | Candidate boundaries, disconnected Add, Commit and Welcome validation. `TestSignedIdentityChangingCommit` proves MLS accepts correctly authenticated credential and signature-key changes while DAVE rejects both before adoption. The key-rotation fixture uses the old key for the outer Commit and the new key for its Leaf, recomputing transcript and confirmation data. Remove only when upstream has equivalent checks and authenticated regressions pass. |
 | DAVE-RESET-01 | `session.go`, `mls.go`: invalidation clears pending transition/candidates/readiness, drops send keys and expires old receive epochs. Established groups ignore External Sender replacement; unestablished groups rebuild on change. Preserve bounded recovery/degraded guards. | Reset, External Sender, readiness, move and shutdown tests. Remove when upstream has equivalent lifecycle behavior. |
 | DAVE-KEYS-01 | `mediakeys/ratchet.go`, `mls.go`, `session.go`: Execute switches sending immediately; receive retention expires after 10 seconds including downgrade. Immutable base-secret SHA-256 identity selects nonce reset without old generation derivation. Never log this identity. | Same/new-domain, discarded ratchet, synthetic generation 257, downgrade and retention tests. Remove when upstream preserves nonce uniqueness and receive expiry across these transitions. |
 | DAVE-DIAGNOSTICS-01 | Non-secret KeyPackage callback counters and handshake progress. Callback success is not server acknowledgement. | Diagnostic and dropped-send tests. Remove when upstream supplies equivalent milestones or the consumer no longer needs them. |
@@ -83,10 +83,12 @@ alone is not evidence that a delta can be removed.
 selects either Go or official Commit after batch Add, split Add, and split Add
 followed by revoking the first proposal; each case verifies 100 new-epoch frames.
 All six cases pass with local candidate changes; the previous fork fails the
-split-input cases. Root integration and live Discord checks remain pending.
+split-input cases. Root checks and fixed-version interoperability pass. The managed after-track restart deployed 91c784a; the user confirmed the affected VC round-trip behavior.
 These synthetic tests do not establish the cause of historical readiness stalls.
 MLS memory storage is used; durable-store multi-write atomicity remains outside
 the new API guarantee, as recorded in the MLS fork's ledger. Consumer and interop
 dependencies must be pinned to identical revisions at integration.
 
 Current MLS dependency: hrko/mls-go `v1.6.1-0.20261111041611-caef2a26c624` (MLS-CANDIDATE-01 and MLS-BATCH-01).
+
+Additional regressions verify duplicate Remove rejection without partial state, candidate disposal on shutdown, and actual old-epoch frame decryption before expiry and rejection after expiry (a distinct unseen nonce avoids conflating expiry with replay rejection).
