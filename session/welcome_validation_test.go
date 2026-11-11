@@ -322,8 +322,8 @@ func TestOnDaveMLSWelcome_RejectsUnsupportedCipherSuite(t *testing.T) {
 	}
 }
 
-// TestJoinGroup_RecoversMLSPanic feeds mls-go a Welcome it panics on, past the
-// cipher suite check, to exercise the backstop behind it.
+// TestJoinGroup_RecoversMLSPanic forces a panic in the join to exercise the
+// backstop on the one call that hands gateway bytes to mls-go.
 func TestJoinGroup_RecoversMLSPanic(t *testing.T) {
 	cb := &invalidCountingCallbacks{}
 	var logs bytes.Buffer
@@ -334,7 +334,6 @@ func TestJoinGroup_RecoversMLSPanic(t *testing.T) {
 	externalSenderPackage := buildExternalSenderPackage(t)
 	setExternalSenderPackage(t, s, externalSenderPackage)
 	_, welcome := newWelcomeForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
-	welcome = withWelcomeCipherSuite(t, welcome, 0x0080, false)
 
 	s.lockMLS()
 	var err error
@@ -347,6 +346,9 @@ func TestJoinGroup_RecoversMLSPanic(t *testing.T) {
 		}()
 		if err = s.ensureMLSClientLocked(); err != nil {
 			t.Fatalf("ensureMLSClientLocked: %v", err)
+		}
+		s.mlsClient.joinGroup = func(context.Context, []byte) ([]byte, error) {
+			panic("forced by test")
 		}
 		_, err = s.joinGroupLocked(welcome)
 	}()

@@ -1,6 +1,9 @@
 # AsterinMusic maintenance fork
 
 Base: thomas-vilte/dave-go `ffcbed03c2166770f138a806b7471cbc1f02009c`.
+Merged upstream `912e81502610f95b12ae9706a2de5209c76b83dd` (PR #62):
+the panic recovery test uses a deterministic JoinGroup hook, preserving this
+fork's channel/member validation fixtures. Normal JoinGroup behavior is unchanged.
 The original module path is preserved; consumers pin this repository with a Go
 module `replace` directive. This fork is not an independent cryptographic audit.
 
