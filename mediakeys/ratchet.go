@@ -1,6 +1,7 @@
 package mediakeys
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -35,7 +36,8 @@ type cachedGeneration struct {
 }
 
 type KeyRatchet struct {
-	mu sync.Mutex
+	domainIdentity [32]byte
+	mu             sync.Mutex
 
 	retentionTTL     time.Duration
 	maxGenerationGap uint32
@@ -56,6 +58,7 @@ func NewKeyRatchet(baseSecret []byte, opts ...Option) (*KeyRatchet, error) {
 	}
 
 	r := &KeyRatchet{
+		domainIdentity:   sha256.Sum256(baseSecret),
 		retentionTTL:     DefaultRetentionTTL,
 		maxGenerationGap: DefaultMaxGenerationGap,
 		now:              time.Now,
@@ -69,6 +72,10 @@ func NewKeyRatchet(baseSecret []byte, opts ...Option) (*KeyRatchet, error) {
 
 	return r, nil
 }
+
+// DomainIdentity identifies the original key domain independently of the
+// current ratchet generation. It must not be logged or used as key material.
+func (r *KeyRatchet) DomainIdentity() [32]byte { return r.domainIdentity }
 
 // CurrentGeneration returns the ratchet's committed base generation — the
 // lowest generation still derivable from baseSecret. It advances via Commit,

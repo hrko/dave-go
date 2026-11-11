@@ -476,6 +476,7 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 		return false, err
 	}
 	acceptedAny := false
+	var acceptedMessages [][]byte
 	for i, item := range items {
 		msg := item.message
 
@@ -487,14 +488,14 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 				"error", err,
 				"index", i)
 
-			continue
+			return false, fmt.Errorf("proposal batch rejected by DAVE policy")
 		}
 		if !allowed {
 			s.stats.ProposalsRejected++
 			s.logger.Warn("processProposalBatchLocked: rejecting disallowed proposal sender/type",
 				"index", i)
 
-			continue
+			return false, fmt.Errorf("proposal batch rejected by DAVE policy")
 		}
 
 		userID, ok, err := s.addProposalUserID(msg)
@@ -511,7 +512,7 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 				"error", err,
 				"index", i)
 
-			continue
+			return false, fmt.Errorf("proposal batch rejected by DAVE policy")
 		}
 		if ok {
 			if _, exists := s.users[userID]; !exists {
@@ -520,15 +521,16 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 					"user_id", userID,
 					"index", i)
 
-				continue
+				return false, fmt.Errorf("proposal batch rejected by DAVE policy")
 			}
 		}
 
 		// Use original bytes (not re-marshaled) so ProposalRef hash matches gateway's computation.
-		if err := s.mlsClient.client.ProcessPublicMessage(context.Background(), s.groupID, item.wire); err != nil {
-			return acceptedAny, fmt.Errorf("process proposal public message: %w", err)
-		}
+		acceptedMessages = append(acceptedMessages, item.wire)
 		acceptedAny = true
+	}
+	if err := s.mlsClient.client.ApplyProposalBatch(context.Background(), s.groupID, acceptedMessages, nil); err != nil {
+		return false, fmt.Errorf("process proposal batch: %w", err)
 	}
 
 	s.logger.Debug("processProposalBatchLocked: all proposals processed successfully")
@@ -819,23 +821,14 @@ func (s *Session) activatePendingEpochLocked() {
 	s.groupID = append([]byte(nil), s.pendingGroupID...)
 	s.pendingGroupID = nil
 	// Execute switches sending immediately. Retention is receive-side only.
-	// Compare at the old ratchet's current generation: generation zero may
-	// already have been erased. Never reset the counter for the same key.
-	previous := s.sendRatchet
-	if s.retainedSendRatchet != nil {
-		previous = s.retainedSendRatchet
-	}
 	s.retainedSendRatchet = nil
 	s.retainedSendExpiresAt = time.Time{}
-
 	if sender := s.activeEpoch.senders[s.userID]; sender != nil {
-		if previous != nil {
-			generation := previous.CurrentGeneration()
-			oldKey, oldErr := previous.GetKey(generation)
-			newKey, newErr := sender.ratchet.GetKey(generation)
-			if oldErr == nil && newErr == nil && !bytes.Equal(oldKey, newKey) {
-				s.sendCounter.Reset()
-			}
+		domain := sender.ratchet.DomainIdentity()
+		if !s.hasSendDomain || s.sendDomain != domain {
+			s.sendCounter.Reset()
+			s.sendDomain = domain
+			s.hasSendDomain = true
 		}
 		s.sendRatchet = sender.ratchet
 		s.recoveryAttempts = 0
@@ -853,19 +846,6 @@ func (s *Session) activatePendingEpochLocked() {
 
 	s.pruneRetainedEpochsLocked()
 
-	// Drain queued proposal batches now that the pending epoch has been
-	// activated. Process them one at a time so that each commit can be
-	// queued again if another pending epoch accumulates mid-drain.
-	s.drainProposalQueueLocked()
-}
-
-func (s *Session) drainProposalQueueLocked() {
-	for len(s.proposalQueue) > 0 && s.pendingEpoch == nil {
-		next := s.proposalQueue[0]
-		s.proposalQueue = s.proposalQueue[1:]
-		s.logger.Debug("draining queued proposal batch", "size", len(next), "remaining_queue", len(s.proposalQueue))
-		s.processAndCommitProposalBatchLocked(next)
-	}
 }
 
 func (s *Session) pruneRetainedEpochsLocked() {
@@ -920,26 +900,6 @@ func (s *Session) createGroupWithExternalSenderLocked() error {
 	return nil
 }
 
-// restorePreCommitStateLocked rolls the MLS group back to the snapshot taken
-// just before the last commit. Called when Discord DS echoes a different commit
-// (i.e. another member's commit won) so that processCommitLocked can apply the
-// winning commit from the correct base epoch. Must be called with s.mu held.
-func (s *Session) restorePreCommitStateLocked() error {
-	if len(s.preCommitGroupState) == 0 {
-		return ErrNoPreCommitState
-	}
-	gid := group.NewGroupID(s.groupID)
-	if err := s.mlsClient.store.SaveGroupState(context.Background(), gid, s.preCommitGroupState); err != nil {
-		return fmt.Errorf("restore pre-commit state: %w", err)
-	}
-	s.pendingEpoch = nil
-	s.pendingGroupID = nil
-	s.pendingCommitBytes = nil
-	s.preCommitGroupState = nil
-
-	return nil
-}
-
 // invalidateAndResendKeyPackageLocked resets the local MLS state and sends a
 // new key package to the voice gateway. Called after SendInvalidCommitWelcome
 // per the DAVE protocol spec §"Recovery from Invalid Commit or Welcome":
@@ -960,13 +920,19 @@ func (s *Session) invalidateAndResendKeyPackageLocked() {
 }
 
 func (s *Session) invalidateMLSStateLocked() {
+	s.clearCommitCandidatesLocked()
+	s.pendingTransitionID = 0
+	if s.activeEpoch != nil {
+		s.activeEpoch.expiresAt = time.Now().Add(epochRetention)
+		s.retainedEpoch = append(s.retainedEpoch, s.activeEpoch)
+		s.activeEpoch = nil
+	}
+	s.dropSendKeysLocked()
 	s.mlsClient = nil
 	s.groupID = nil
 	s.pendingGroupID = nil
 	s.pendingEpoch = nil
 	s.pendingCommitBytes = nil
-	s.preCommitGroupState = nil
-	s.proposalQueue = nil
 	s.pendingKeyPackage = nil
 	s.markDegradedLocked("invalid commit or welcome, MLS state reset")
 	// Fresh channel so the recovery watchdog waits for an epoch activated
@@ -1082,94 +1048,9 @@ func (s *Session) recoverAfterTimeout(transitionID uint16, ready <-chan struct{}
 }
 
 func (s *Session) commitProposalsLocked() error {
-	s.logger.Debug("commitProposalsLocked: starting commit", "group_id", fmt.Sprintf("%x", s.groupID))
-
-	// Snapshot the pre-commit group state. If Discord DS accepts a competing
-	// commit instead of ours, we restore this snapshot so processCommitLocked
-	// can apply the DS-winning commit from the correct epoch.
-	gid := group.NewGroupID(s.groupID)
-	preState, err := s.mlsClient.store.LoadGroupState(context.Background(), gid)
-	if err != nil {
-		return fmt.Errorf("snapshot pre-commit state: %w", err)
+	if err := s.prepareCommitCandidateLocked(); err != nil {
+		return err
 	}
-
-	// DAVE-specific GroupInfo options:
-	// - external_pub is NOT needed (DAVE doesn't use external commits)
-	// - ratchet_tree IS needed (joiners need the tree to instantiate the group)
-	commit, welcome, err := s.mlsClient.client.CommitPendingProposalsWithOptions(
-		context.Background(),
-		s.groupID,
-		mls.CommitPendingProposalsOptions{
-			GroupInfoOptions: []group.InfoOption{
-				group.WithExternalPub(false),
-			},
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("commit pending proposals: %w", err)
-	}
-
-	s.logger.Debug("commitProposalsLocked: commit created", "commit_size", len(commit), "welcome_size", len(welcome))
-	s.logger.Debug("commitProposalsLocked: commit hex", "commit_hex", fmt.Sprintf("%x", commit))
-
-	// CommitPendingProposals advances the local epoch immediately (MergeCommit).
-	// Pre-populate pendingEpoch so that when op 29 arrives (gateway echoes the commit
-	// back to the committer), OnDaveMLSPrepareCommitTransition can confirm our epoch.
-	// If op 29 carries a DIFFERENT commit, restorePreCommitStateLocked() rolls back.
-	s.pendingCommitBytes = append([]byte(nil), commit...)
-	s.preCommitGroupState = preState
-
-	epochState, err := s.rebuildEpochStateLocked(s.groupID)
-	if err != nil {
-		return fmt.Errorf("rebuild epoch after commit: %w", err)
-	}
-	s.pendingEpoch = epochState
-	s.pendingGroupID = append([]byte(nil), s.groupID...)
-
-	s.logger.Debug("commitProposalsLocked: pendingEpoch set",
-		"epoch_id", epochState.id,
-		"sender_count", len(epochState.senders),
-		"has_self", func() bool {
-			_, ok := epochState.senders[s.userID]
-
-			return ok
-		}())
-
-	// DAVE opcode 28 spec v1.1.2:
-	// MLSMessage(commit) || Welcome(struct)
-	// CommitPendingProposals returns the welcome already wrapped in an MLSMessage.
-	// We MUST unwrap it so the Discord gateway can parse it properly.
-	payload := commit
-	if len(welcome) > 0 {
-		wMsg, err := framing.UnmarshalMLSMessage(welcome)
-		if err != nil {
-			return fmt.Errorf("unwrap welcome message: %w", err)
-		}
-		if wMsg.Welcome != nil {
-			payload = append(payload, wMsg.Welcome...)
-		} else {
-			return ErrExpectedWelcome
-		}
-	}
-
-	if s.callbacks == nil {
-		s.logger.Debug("commitProposalsLocked: no callbacks, skipping send")
-
-		return nil
-	}
-	s.logger.Debug("commitProposalsLocked: sending commit/welcome to gateway", "payload_size", len(payload))
-	if err := s.sendLocked(func() error { return s.callbacks.SendMLSCommitWelcome(payload) }); err != nil {
-		// Roll back the local commit so the in-memory MLS state stays
-		// consistent with the gateway, which never got it.
-		if rbErr := s.restorePreCommitStateLocked(); rbErr != nil {
-			s.logger.Error("commitProposalsLocked: rollback after transport failure failed", "error", rbErr)
-		}
-		s.logger.Warn("commit not sent; rolled back local MLS state", "error", err)
-		s.watchDroppedSendLocked(err)
-
-		return nil
-	}
-
 	// Start a background recovery goroutine. If Discord does not confirm our
 	// commit via op:29 within the timeout, the epoch will never activate.
 	// The goroutine either exits early when epochReady is closed (normal path)
@@ -1197,7 +1078,7 @@ func (s *Session) commitProposalsLocked() error {
 			return
 		case <-time.After(timeout):
 		}
-		s.recoverAfterTimeout(transitionID, ready, func() bool { return s.pendingEpoch != nil },
+		s.recoverAfterTimeout(transitionID, ready, func() bool { return len(s.commitCandidates) > 0 || s.pendingEpoch != nil },
 			"commit not confirmed by Discord, triggering recovery")
 	})
 
@@ -1234,7 +1115,7 @@ func (s *Session) processRevokeProposalsLocked(payload []byte) error {
 	if err != nil || len(refs) == 0 {
 		return err
 	}
-	if err := s.mlsClient.client.RevokeProposals(context.Background(), s.groupID, refs); err != nil {
+	if err := s.mlsClient.client.ApplyProposalBatch(context.Background(), s.groupID, nil, refs); err != nil {
 		return fmt.Errorf("revoke proposals: %w", err)
 	}
 	s.logger.Debug("revoke applied", "ref_count", len(refs))

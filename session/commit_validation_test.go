@@ -154,6 +154,9 @@ func TestOnDaveMLSPrepareCommitTransition_OverPendingEpoch(t *testing.T) {
 
 			peerCommit := func() []byte {
 				t.Helper()
+				if !tt.ownCommit {
+					stageValidPeerAdd(t, s, peer, extPriv, groupID)
+				}
 				commit, _, err := peer.CommitPendingProposals(ctx, groupID)
 				if err != nil {
 					t.Fatalf("peer.CommitPendingProposals: %v", err)
@@ -169,7 +172,11 @@ func TestOnDaveMLSPrepareCommitTransition_OverPendingEpoch(t *testing.T) {
 			if tt.ownCommit {
 				const joiner = "222222222"
 				s.AddUser(joiner)
-				s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
+				wire := addProposalBytesForUser(t, s, extPriv, joiner)
+				s.OnDaveMLSProposals(buildProposalBatch(wire))
+				if err := peer.ProcessPublicMessage(ctx, groupID, wire); err != nil {
+					t.Fatal(err)
+				}
 				s.mu.RLock()
 				committed := len(s.pendingCommitBytes) > 0
 				s.mu.RUnlock()

@@ -32,6 +32,9 @@ func (s *Session) Close() error {
 		s.watchdogMu.Unlock()
 		go func() {
 			s.watchdogs.Wait()
+			s.mu.Lock()
+			s.clearCommitCandidatesLocked()
+			s.mu.Unlock()
 			close(s.shutdownDone)
 		}()
 	})

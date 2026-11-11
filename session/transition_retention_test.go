@@ -2,6 +2,7 @@ package session
 
 import (
 	"testing"
+	"unsafe"
 
 	"github.com/disgoorg/godave"
 	"github.com/thomas-vilte/dave-go/mediakeys"
@@ -42,6 +43,8 @@ func setupForActivation(t *testing.T, oldMembers, newMembers []godave.UserID) *S
 	s.mu.Lock()
 	s.activeEpoch = &epochState{id: 0, senders: oldSenders}
 	s.sendRatchet = oldSenders[bot].ratchet
+	s.sendDomain = s.sendRatchet.DomainIdentity()
+	s.hasSendDomain = true
 	s.pendingEpoch = &epochState{id: 1, groupID: []byte("g"), senders: newSenders}
 	s.pendingGroupID = []byte("g")
 	s.mu.Unlock()
@@ -119,5 +122,48 @@ func TestActivate_SameKeyPreservesCounter(t *testing.T) {
 	s.activatePendingEpochLocked()
 	if n := s.sendCounter.Current(); n != 5 {
 		t.Fatalf("same-key activation reset nonce counter: got %d, want 5", n)
+	}
+}
+
+func TestActivate_NewDomainAfterLongLivedCounter(t *testing.T) {
+	s := setupForActivation(t, []godave.UserID{"bot"}, []godave.UserID{"bot"})
+	closeAtCleanup(t, s)
+	s.sendRatchet.Commit(256)
+	s.sendRatchet.Commit(257)
+	// Test-only synthetic counter: avoid billions of packets. Guard the pinned
+	// representation and never use this accessor concurrently with encryption.
+	if unsafe.Sizeof(*s.sendCounter) != unsafe.Sizeof(uint64(0)) {
+		t.Fatal("nonce counter representation changed")
+	}
+	*(*uint64)(unsafe.Pointer(s.sendCounter)) = uint64(257) << 24
+	s.protocolVersion = 1
+	s.pendingTransitionID = 8
+	s.OnDaveExecuteTransition(8)
+	if s.sendCounter.Current() != 0 {
+		t.Fatal("new key domain inherited old generation")
+	}
+	if _, err := s.Encrypt(1, []byte{1, 2, 3}, make([]byte, 128)); err != nil {
+		t.Fatalf("new domain cannot encrypt: %v", err)
+	}
+}
+
+func TestActivate_AfterRatchetDiscard(t *testing.T) {
+	for _, same := range []bool{false, true} {
+		t.Run(map[bool]string{false: "new domain", true: "same domain"}[same], func(t *testing.T) {
+			s := setupForActivation(t, []godave.UserID{"bot"}, []godave.UserID{"bot"})
+			closeAtCleanup(t, s)
+			s.sendRatchet = nil
+			if same {
+				s.pendingEpoch.senders["bot"].ratchet = newRatchet(t, 0x01)
+			}
+			s.activatePendingEpochLocked()
+			want := uint64(0)
+			if same {
+				want = 5
+			}
+			if got := s.sendCounter.Current(); got != want {
+				t.Fatalf("counter=%d, want %d", got, want)
+			}
+		})
 	}
 }

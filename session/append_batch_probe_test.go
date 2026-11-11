@@ -21,6 +21,7 @@ func TestConcatenatedAppendBatch(t *testing.T) {
 	if cb.commits != 1 {
 		t.Fatalf("commits=%d, want 1", cb.commits)
 	}
+	confirmLatestCandidate(t, s)
 	if s.pendingEpoch == nil || len(s.pendingEpoch.senders) != 3 {
 		t.Fatal("both joiners must be included in the committed epoch")
 	}

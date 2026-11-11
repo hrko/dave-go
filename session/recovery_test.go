@@ -303,11 +303,12 @@ func TestReadyForTransitionDropped_ArmsRecoveryWithoutActiveEpoch(t *testing.T) 
 			closeAtCleanup(t, s)
 			s.SetChannelID(987654321)
 			s.OnSelectProtocolAck(1)
-			externalSenderPackage := buildExternalSenderPackage(t)
+			externalSenderPackage, extPriv := buildExternalSenderPackageWithKey(t)
 			setExternalSenderPackage(t, s, externalSenderPackage)
 			peer, groupID, welcome := newPeerGroupForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
 			s.OnDaveMLSWelcome(tt.welcomeTransitionID, welcome)
 			if tt.peerCommit {
+				stageValidPeerAdd(t, s, peer, extPriv, groupID)
 				commit, _, err := peer.CommitPendingProposals(context.Background(), groupID)
 				if err != nil {
 					t.Fatalf("peer.CommitPendingProposals: %v", err)

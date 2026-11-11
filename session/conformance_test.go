@@ -28,7 +28,7 @@ func TestRevokeUnconfirmedCommit(t *testing.T) {
 			if cb.commits != 1 {
 				t.Fatalf("initial commit count: %d", cb.commits)
 			}
-			snapshot, err := group.UnmarshalGroupState(s.preCommitGroupState)
+			snapshot, err := group.UnmarshalGroupState(currentGroupBytes(t, s))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -46,6 +46,7 @@ func TestRevokeUnconfirmedCommit(t *testing.T) {
 					t.Fatal("empty cache generated a commit")
 				}
 			} else {
+				confirmLatestCandidate(t, s)
 				if cb.commits != 2 || s.pendingEpoch == nil {
 					t.Fatal("remaining proposal was not recommitted")
 				}
@@ -98,7 +99,7 @@ func TestRevokeMalformedDoesNotAlterPendingCommit(t *testing.T) {
 	}
 }
 
-func TestRevokeAllDrainsQueuedAppend(t *testing.T) {
+func TestRevokeFirstPreservesSecondCandidate(t *testing.T) {
 	s, key := setupActiveSoleMemberSessionWithKey(t)
 	defer s.Close()
 	cb := &commitCountingCallbacks{}
@@ -108,23 +109,24 @@ func TestRevokeAllDrainsQueuedAppend(t *testing.T) {
 	first := addProposalBytesForUser(t, s, key, "222")
 	second := addProposalBytesForUser(t, s, key, "333")
 	s.OnDaveMLSProposals(buildProposalBatch(first))
-	snapshot, err := group.UnmarshalGroupState(s.preCommitGroupState)
+	snapshot, err := group.UnmarshalGroupState(currentGroupBytes(t, s))
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.OnDaveMLSProposals(buildProposalBatch(second))
-	if len(s.proposalQueue) != 1 {
-		t.Fatal("fixture did not queue second proposal")
+	if len(s.commitCandidates) != 2 {
+		t.Fatal("fixture did not prepare second candidate")
 	}
 	s.OnDaveMLSProposals(buildRevokeBatch(snapshot.StoredProposals()[0].Ref))
-	if cb.commits != 2 || len(s.proposalQueue) != 0 || s.pendingEpoch == nil {
-		t.Fatal("queued append stranded after revoke")
+	confirmLatestCandidate(t, s)
+	if cb.commits != 3 || len(s.commitCandidates) != 0 || s.pendingEpoch == nil {
+		t.Fatal("candidate missing after revoke")
 	}
 	if _, revoked := s.pendingEpoch.senders["222"]; revoked {
 		t.Fatal("revoked user survived")
 	}
 	if _, added := s.pendingEpoch.senders["333"]; !added {
-		t.Fatal("queued user missing")
+		t.Fatal("remaining user missing")
 	}
 }
 

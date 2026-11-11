@@ -143,11 +143,11 @@ func TestDowngradeV0_ExecuteRetainsEpochForReceive(t *testing.T) {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.activeEpoch == nil {
-		t.Fatal("activeEpoch should NOT be nil after v0 execute (needed for receive retention)")
+	if s.activeEpoch != nil || len(s.retainedEpoch) != 1 {
+		t.Fatal("old epoch must be retained with expiry, not remain active")
 	}
-	if s.activeEpoch.id != 1 {
-		t.Fatalf("activeEpoch.id = %d, want 1", s.activeEpoch.id)
+	if s.retainedEpoch[0].id != 1 || s.retainedEpoch[0].expiresAt.IsZero() {
+		t.Fatal("retained epoch must be epoch 1 with an expiry")
 	}
 }
 

@@ -84,7 +84,7 @@ func TestOnDaveMLSWelcome_ValidatesExternalSender(t *testing.T) {
 		t.Fatal("expected a key package after protocol ack")
 	}
 
-	externalSenderPackage := buildExternalSenderPackage(t)
+	externalSenderPackage, _ := buildExternalSenderPackageWithKey(t)
 	setExternalSenderPackage(t, s, externalSenderPackage)
 
 	groupID, welcome := newWelcomeForExternalSender(t, s, botKP, externalSenderPackage)
@@ -180,13 +180,14 @@ func TestOnDaveMLSWelcome_OverPeerPendingEpoch(t *testing.T) {
 			closeAtCleanup(t, s)
 			s.SetChannelID(987654321)
 			s.OnSelectProtocolAck(1)
-			externalSenderPackage := buildExternalSenderPackage(t)
+			externalSenderPackage, extPriv := buildExternalSenderPackageWithKey(t)
 			setExternalSenderPackage(t, s, externalSenderPackage)
 			botKP := cb.lastKeyPackage()
 			peer, groupID, welcome := newPeerGroupForExternalSender(t, s, botKP, externalSenderPackage)
 			s.OnDaveMLSWelcome(tt.welcomeTransitionID, welcome)
 			transitionID := tt.welcomeTransitionID
 			if tt.peerCommit {
+				stageValidPeerAdd(t, s, peer, extPriv, groupID)
 				commit, _, err := peer.CommitPendingProposals(context.Background(), groupID)
 				if err != nil {
 					t.Fatalf("peer.CommitPendingProposals: %v", err)
@@ -240,10 +241,10 @@ func TestOnDaveMLSWelcome_AfterOwnCommit(t *testing.T) {
 		s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
 	}
 	s.mu.RLock()
-	committed, queued := len(s.pendingCommitBytes) > 0, len(s.proposalQueue)
+	committed, queued := len(s.pendingCommitBytes) > 0, len(s.commitCandidates)
 	s.mu.RUnlock()
-	if !committed || queued != 1 {
-		t.Fatalf("committed = %v with %d queued batches, want a commit and 1 queued batch", committed, queued)
+	if !committed || queued != 2 {
+		t.Fatalf("committed = %v with %d candidates, want two independent candidates", committed, queued)
 	}
 
 	peer, groupID, welcome := newPeerGroupForExternalSender(t, s, botKP, externalSenderPackage)
@@ -265,8 +266,8 @@ func TestOnDaveMLSWelcome_AfterOwnCommit(t *testing.T) {
 	if s.pendingEpoch == nil || s.pendingEpoch.id != wantEpoch {
 		t.Fatalf("pending epoch = %+v, want epoch %d", s.pendingEpoch, wantEpoch)
 	}
-	if len(s.pendingCommitBytes) != 0 || len(s.proposalQueue) != 0 {
-		t.Fatalf("%d bytes of our commit and %d queued batches left after the Welcome", len(s.pendingCommitBytes), len(s.proposalQueue))
+	if len(s.pendingCommitBytes) != 0 || len(s.commitCandidates) != 0 {
+		t.Fatalf("%d bytes of our commit and %d candidates left after the Welcome", len(s.pendingCommitBytes), len(s.commitCandidates))
 	}
 }
 
@@ -292,7 +293,7 @@ func TestOnDaveMLSWelcome_RejectsUnsupportedCipherSuite(t *testing.T) {
 			closeAtCleanup(t, s)
 			s.SetChannelID(987654321)
 			s.OnSelectProtocolAck(1)
-			externalSenderPackage := buildExternalSenderPackage(t)
+			externalSenderPackage, _ := buildExternalSenderPackageWithKey(t)
 			setExternalSenderPackage(t, s, externalSenderPackage)
 			botKP := cb.lastKeyPackage()
 			_, welcome := newWelcomeForExternalSender(t, s, botKP, externalSenderPackage)
@@ -331,7 +332,7 @@ func TestJoinGroup_RecoversMLSPanic(t *testing.T) {
 	closeAtCleanup(t, s)
 	s.SetChannelID(987654321)
 	s.OnSelectProtocolAck(1)
-	externalSenderPackage := buildExternalSenderPackage(t)
+	externalSenderPackage, _ := buildExternalSenderPackageWithKey(t)
 	setExternalSenderPackage(t, s, externalSenderPackage)
 	_, welcome := newWelcomeForExternalSender(t, s, cb.lastKeyPackage(), externalSenderPackage)
 

@@ -67,7 +67,7 @@ func TestCommitRecovery_SkipsOnceReadyCloses(t *testing.T) {
 	s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
 
 	s.lockMLS()
-	if s.pendingEpoch == nil {
+	if len(s.commitCandidates) == 0 {
 		s.unlockMLS()
 		t.Fatal("session did not commit the proposal")
 	}

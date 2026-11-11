@@ -140,9 +140,8 @@ func TestOnSelectProtocolAck_DiscardsPreviousChannelState(t *testing.T) {
 	}}
 	s.pendingEpoch = &epochState{id: 6, groupID: []byte("pending-group-A")}
 	s.retainedEpoch = []*epochState{{id: 4}}
-	s.proposalQueue = [][]byte{{0x01, 0x02}}
+	s.commitCandidates = []*mls.CommitCandidate{new(mls.CommitCandidate)}
 	s.pendingCommitBytes = []byte{0xAA}
-	s.preCommitGroupState = []byte{0xBB}
 	s.sendRatchet = ratchet
 	s.mu.Unlock()
 
@@ -168,14 +167,11 @@ func TestOnSelectProtocolAck_DiscardsPreviousChannelState(t *testing.T) {
 	if len(s.retainedEpoch) != 0 {
 		t.Errorf("retainedEpoch not cleared: %+v", s.retainedEpoch)
 	}
-	if len(s.proposalQueue) != 0 {
-		t.Errorf("proposalQueue not cleared: %+v", s.proposalQueue)
+	if len(s.commitCandidates) != 0 {
+		t.Errorf("commitCandidates not cleared: %+v", s.commitCandidates)
 	}
 	if s.pendingCommitBytes != nil {
 		t.Errorf("pendingCommitBytes not cleared: %x", s.pendingCommitBytes)
-	}
-	if s.preCommitGroupState != nil {
-		t.Errorf("preCommitGroupState not cleared: %x", s.preCommitGroupState)
 	}
 	if s.sendRatchet != nil {
 		t.Error("sendRatchet not cleared")
@@ -319,11 +315,11 @@ func TestSessionMove_StaleProposalIgnored_AndNewChannelJoinsCleanly(t *testing.T
 	if len(s.retainedEpoch) != 0 {
 		t.Errorf("retainedEpoch should be empty for a fresh post-move session: %+v", s.retainedEpoch)
 	}
-	if len(s.proposalQueue) != 0 {
-		t.Errorf("proposalQueue should be empty for a fresh post-move session: %+v", s.proposalQueue)
+	if len(s.commitCandidates) != 0 {
+		t.Errorf("commitCandidates should be empty for a fresh post-move session: %+v", s.commitCandidates)
 	}
-	if s.pendingCommitBytes != nil || s.preCommitGroupState != nil {
-		t.Error("pendingCommitBytes/preCommitGroupState should be nil for a fresh post-move session")
+	if s.pendingCommitBytes != nil || len(s.commitCandidates) != 0 {
+		t.Error("pendingCommitBytes/commitCandidates should be nil for a fresh post-move session")
 	}
 }
 
@@ -333,12 +329,12 @@ func buildProposalBatch(proposalBytes []byte) []byte {
 	return append([]byte{0x00}, writeVLBytes(proposalBytes)...)
 }
 
-// TestCommitSend_ShardNotReady_RollsBackAndArmsRecovery verifies that when
+// TestCommitSend_ShardNotReady_DiscardsCandidateAndArmsRecovery verifies that when
 // SendMLSCommitWelcome fails because the voice gateway is down ("shard is not
-// ready"), commitProposalsLocked rolls the local MLS epoch back to its
-// pre-commit state and arms the recovery watchdog, since a resumed connection
+// ready"), commitProposalsLocked discards the candidate, preserving the
+// confirmed state, and arms the recovery watchdog, since a resumed connection
 // brings no OnSelectProtocolAck to reset the session.
-func TestCommitSend_ShardNotReady_RollsBackAndArmsRecovery(t *testing.T) {
+func TestCommitSend_ShardNotReady_DiscardsCandidateAndArmsRecovery(t *testing.T) {
 	cb := &shardDownCallbacks{}
 	s, extPriv := setupActiveSoleMemberSessionWithKey(t)
 	s.callbacks = cb
@@ -349,7 +345,7 @@ func TestCommitSend_ShardNotReady_RollsBackAndArmsRecovery(t *testing.T) {
 	s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
 
 	s.mu.RLock()
-	if s.pendingEpoch != nil || s.pendingCommitBytes != nil || s.preCommitGroupState != nil {
+	if s.pendingEpoch != nil || s.pendingCommitBytes != nil || len(s.commitCandidates) != 0 {
 		t.Error("pending commit state left behind after the commit was dropped")
 	}
 	epoch, err := s.mlsClient.client.Epoch(context.Background(), s.groupID)

@@ -16,6 +16,7 @@ import (
 	"github.com/thomas-vilte/dave-go/codecs"
 	"github.com/thomas-vilte/dave-go/frame"
 	"github.com/thomas-vilte/dave-go/mediakeys"
+	"github.com/thomas-vilte/mls-go"
 )
 
 var _ godave.Session = (*Session)(nil)
@@ -84,8 +85,10 @@ type Session struct {
 	pendingEpoch  *epochState
 	retainedEpoch []*epochState
 
-	sendCounter *mediakeys.NonceCounter
-	sendRatchet *mediakeys.KeyRatchet
+	sendCounter   *mediakeys.NonceCounter
+	sendDomain    [32]byte
+	hasSendDomain bool
+	sendRatchet   *mediakeys.KeyRatchet
 
 	// Retained send keys bridge a reset only until a new epoch executes.
 	// Execute always clears them; post-execute retention is receive-side only.
@@ -108,18 +111,10 @@ type Session struct {
 	pendingKeyPackage     []byte
 	lastProposalBatch     []byte
 
-	// proposalQueue holds proposal batches received while a pendingEpoch is
-	// waiting for ExecuteTransition. They are replayed in order once the
-	// pending epoch is activated, preventing intermediate epoch states from
-	// being lost when Discord DS sends multiple proposal batches in quick
-	// succession before confirming the previous transition.
-	proposalQueue [][]byte
-
-	// pendingCommitBytes is the raw commit we sent to Discord DS (op28).
-	// If op29 arrives with a DIFFERENT commit (another client's commit won),
-	// we restore preCommitState, clear pendingEpoch, and process the winner.
-	pendingCommitBytes  []byte
-	preCommitGroupState []byte
+	// pendingCommitBytes identifies the latest outbound candidate. Candidate
+	// generation never advances the confirmed MLS group state.
+	pendingCommitBytes []byte
+	commitCandidates   []*mls.CommitCandidate
 
 	epochReady chan struct{}
 
@@ -640,9 +635,7 @@ func (s *Session) OnSelectProtocolAck(protocolVersion uint16) {
 	s.retainedEpoch = nil
 	s.groupID = nil
 	s.pendingGroupID = nil
-	s.pendingCommitBytes = nil
-	s.preCommitGroupState = nil
-	s.proposalQueue = nil
+	s.clearCommitCandidatesLocked()
 	s.recoveryAttempts = 0
 	s.resetEpochReadyLocked()
 	s.endDegradedLocked()
@@ -749,10 +742,16 @@ func (s *Session) OnDaveExecuteTransition(transitionID uint16) {
 	if s.protocolVersion == 0 {
 		s.stats.DowngradeToV0++
 		s.dropSendKeysLocked()
+		if s.activeEpoch != nil {
+			s.activeEpoch.expiresAt = time.Now().Add(epochRetention)
+			s.retainedEpoch = append(s.retainedEpoch, s.activeEpoch)
+			s.activeEpoch = nil
+		}
+		s.pendingTransitionID = 0
+		s.mlsClient = nil
 		s.pendingEpoch = nil
 		s.pendingGroupID = nil
-		s.pendingCommitBytes = nil
-		s.preCommitGroupState = nil
+		s.clearCommitCandidatesLocked()
 		s.groupID = nil
 		s.resetEpochReadyLocked()
 		s.logger.Debug("downgrade to v0 executed: send-side cleared to passthrough",
@@ -787,9 +786,7 @@ func (s *Session) OnDavePrepareEpoch(epoch int, protocolVersion uint16) {
 	s.retainedEpoch = nil
 	s.groupID = nil
 	s.pendingGroupID = nil
-	s.pendingCommitBytes = nil
-	s.preCommitGroupState = nil
-	s.proposalQueue = nil
+	s.clearCommitCandidatesLocked()
 	s.resetEpochReadyLocked()
 	// Same as OnSelectProtocolAck: keep the send ratchet alive through
 	// the transition window so receivers with the OLD key can still
@@ -813,6 +810,15 @@ func (s *Session) OnDavePrepareEpoch(epoch int, protocolVersion uint16) {
 func (s *Session) OnDaveMLSExternalSenderPackage(externalSenderPackage []byte) {
 	s.lockMLS()
 	defer s.unlockMLS()
+	if s.activeEpoch != nil || s.pendingEpoch != nil {
+		s.logger.Debug("ignoring external sender change for established group")
+		return
+	}
+	if bytes.Equal(s.externalSenderPackage, externalSenderPackage) && len(s.groupID) > 0 {
+		return
+	}
+	s.clearCommitCandidatesLocked()
+	s.groupID = nil
 	s.externalSenderPackage = append([]byte(nil), externalSenderPackage...)
 	err := s.createGroupWithExternalSenderLocked()
 	if errors.Is(err, ErrNoChannelID) {
@@ -835,38 +841,7 @@ func (s *Session) OnDaveMLSProposals(proposals []byte) {
 		"group_id", fmt.Sprintf("%x", s.groupID),
 		"has_group", len(s.groupID) > 0)
 
-	// A locally proposed commit is speculative until the gateway echoes it.
-	// Revoke applies to its pre-commit cache, not the already merged local
-	// epoch. Do not roll back a gateway-confirmed commit or a joined Welcome.
-	if len(proposals) > 0 && proposals[0] == 1 && len(s.pendingCommitBytes) > 0 {
-		if _, err := parseRevokeReferences(proposals[1:]); err != nil {
-			s.logger.Error("invalid revoke batch", "error", err)
-			return
-		}
-		if err := s.restorePreCommitStateLocked(); err != nil {
-			s.logger.Error("failed to restore proposals for revoke", "error", err)
-			return
-		}
-		// Cancel the superseded commit watchdog, even if all proposals vanish.
-		s.resetEpochReadyLocked()
-	}
-
-	// If a pendingEpoch is already waiting for ExecuteTransition, queue this
-	// batch instead of committing immediately. Committing again would advance
-	// the local group state past what Discord DS has accepted, causing the
-	// intermediate epoch to be overwritten and audio keys to diverge.
-	if s.pendingEpoch != nil {
-		s.logger.Debug("OnDaveMLSProposals: pendingEpoch in flight, queuing proposals", "queue_len", len(s.proposalQueue)+1)
-		s.proposalQueue = append(s.proposalQueue, append([]byte(nil), proposals...))
-
-		return
-	}
-
 	s.processAndCommitProposalBatchLocked(proposals)
-	// Revoking every cached proposal can remove the pending epoch entirely.
-	// Previously queued append batches must not wait for an execute that will
-	// never arrive for that discarded local commit.
-	s.drainProposalQueueLocked()
 }
 
 // processAndCommitProposalBatchLocked processes a proposal batch and commits.
@@ -898,6 +873,8 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 		return
 	}
 	if !pending {
+		s.clearCommitCandidatesLocked()
+		s.resetEpochReadyLocked()
 		return
 	}
 	if err := s.commitProposalsLocked(); err != nil {
@@ -917,26 +894,10 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 		}())
 }
 
-// reconcileCompetingCommitLocked handles the case where the DS echoed a commit
-// that is not ours: it rolls back any pending (lost) commit to the pre-commit
-// snapshot and then processes the winning commit. It returns false if the
-// transition must be aborted because the state restore or the commit processing
-// failed. Must be called with s.mu held.
+// reconcileCompetingCommitLocked processes another member's selected Commit
+// against the confirmed MLS state. Local candidates never mutated that state.
+// It returns false when processing fails. Must be called with s.mu held.
 func (s *Session) reconcileCompetingCommitLocked(transitionID uint16, commitMessage []byte) bool {
-	if len(s.pendingCommitBytes) > 0 {
-		// Our commit lost; restore pre-commit state before processing the winner.
-		s.logger.Debug("OnDaveMLSPrepareCommitTransition: competing commit won, rolling back",
-			"transition_id", transitionID,
-			"our_commit_size", len(s.pendingCommitBytes),
-			"winning_commit_size", len(commitMessage))
-		if err := s.restorePreCommitStateLocked(); err != nil {
-			s.logger.Error("failed to restore pre-commit state", "transition_id", transitionID, "error", err)
-			s.sendInvalidCommitWelcomeLocked(transitionID)
-
-			return false
-		}
-	}
-
 	if err := s.processCommitLocked(commitMessage); err != nil {
 		s.stats.CommitsFailed++
 		s.logger.Error("failed to process commit", "transition_id", transitionID, "error", err)
@@ -957,8 +918,7 @@ func (s *Session) OnDaveMLSPrepareCommitTransition(transitionID uint16, commitMe
 	s.logger.Debug("OnDaveMLSPrepareCommitTransition",
 		"transition_id", transitionID,
 		"commit_size", len(commitMessage),
-		"pending_epoch_set", s.pendingEpoch != nil,
-		"commit_hex_prefix", fmt.Sprintf("%x", commitMessage[:minInt(32, len(commitMessage))]))
+		"pending_epoch_set", s.pendingEpoch != nil)
 	s.pendingTransitionID = transitionID
 	if err := s.ensureMLSClientLocked(); err != nil {
 		s.logger.Error("failed to init mls client", "error", err)
@@ -966,20 +926,26 @@ func (s *Session) OnDaveMLSPrepareCommitTransition(transitionID uint16, commitMe
 		return
 	}
 
-	// If pendingEpoch is set AND the DS is echoing our exact commit back, we
-	// were the committer and our local epoch is correct — skip re-processing.
-	//
-	// If the DS echoes a DIFFERENT commit (another client's commit won the
-	// race), we must roll back our local state to the pre-commit snapshot and
-	// process the winning commit instead. Without this, the bot's epoch diverges
-	// from Discord's and audio decryption fails.
-	if s.pendingEpoch != nil && bytes.Equal(s.pendingCommitBytes, commitMessage) {
-		s.logger.Debug("skipping commit re-processing: we were the committer", "transition_id", transitionID)
-		s.pendingCommitBytes = nil
-		s.preCommitGroupState = nil
-	} else if !s.reconcileCompetingCommitLocked(transitionID, commitMessage) {
+	// Validate both own echoes and competing commits before adopting a new
+	// MLS state. The send epoch remains unchanged until ExecuteTransition.
+	if err := s.validateCommitCoverageLocked(commitMessage); err != nil {
+		s.stats.CommitsFailed++
+		s.logger.Warn("commit rejected before adoption", "error", err)
+		s.sendInvalidCommitWelcomeLocked(transitionID)
+		s.invalidateAndResendKeyPackageLocked()
 		return
 	}
+	matched, candidateErr := s.adoptOwnCandidateLocked(commitMessage)
+	if candidateErr != nil {
+		s.logger.Error("failed to adopt commit candidate", "error", candidateErr)
+		s.sendInvalidCommitWelcomeLocked(transitionID)
+		s.invalidateAndResendKeyPackageLocked()
+		return
+	}
+	if !matched && !s.reconcileCompetingCommitLocked(transitionID, commitMessage) {
+		return
+	}
+	s.clearCommitCandidatesLocked()
 
 	// transition_id 0 is executed immediately and is not acknowledged; only send
 	// ready_for_transition for real (non-initial) transitions (matches golibdave).
@@ -1002,25 +968,7 @@ func (s *Session) OnDaveMLSWelcome(transitionID uint16, welcomeMessage []byte) {
 	s.logger.Debug("OnDaveMLSWelcome", "transition_id", transitionID, "welcome_size", len(welcomeMessage))
 	s.pendingTransitionID = transitionID
 
-	// A Welcome after our own commit means Discord DS chose another member's
-	// commit over ours. Roll back to the pre-commit snapshot so that
-	// joinPendingWelcomeLocked operates from the correct epoch. Any other
-	// pending epoch, from a peer's commit or an earlier Welcome, has no
-	// snapshot to roll back to.
-	if len(s.pendingCommitBytes) > 0 {
-		s.logger.Debug("OnDaveMLSWelcome: our commit was rejected by DS (Welcome received), rolling back",
-			"transition_id", transitionID)
-		if err := s.restorePreCommitStateLocked(); err != nil {
-			s.logger.Error("failed to restore pre-commit state on Welcome", "transition_id", transitionID, "error", err)
-			s.sendInvalidCommitWelcomeLocked(transitionID)
-
-			return
-		}
-		// Also clear the proposal queue — those proposals were committed against
-		// our (now-discarded) epoch; the DS will send fresh proposals if needed.
-		s.proposalQueue = nil
-	}
-
+	s.clearCommitCandidatesLocked()
 	if err := s.ensureMLSClientLocked(); err != nil {
 		s.logger.Error("failed to init mls client", "error", err)
 

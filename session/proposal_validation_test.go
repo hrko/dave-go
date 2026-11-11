@@ -174,6 +174,7 @@ func TestOnDaveMLSProposals_AddValidation(t *testing.T) {
 
 		s.OnDaveMLSProposals(buildProposalBatch(proposalBytes))
 
+		confirmLatestCandidate(t, s)
 		if got := memberCount(t, s); got != 2 {
 			t.Fatalf("member count after expected add = %d, want 2", got)
 		}
