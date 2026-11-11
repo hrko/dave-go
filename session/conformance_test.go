@@ -21,13 +21,8 @@ func TestRevokeUnconfirmedCommit(t *testing.T) {
 			s.AddUser("333")
 			p1 := addProposalBytesForUser(t, s, key, "222")
 			p2 := addProposalBytesForUser(t, s, key, "333")
-			// Seed the pre-commit cache separately: mls-go's framing decoder
-			// currently cannot split a concatenated append batch. That is a
-			// separate upstream dependency defect, not a revoke precondition.
-			for _, p := range [][]byte{p1, p2} {
-				if _, err := s.processProposalBatchLocked(buildProposalBatch(p)); err != nil {
-					t.Fatal(err)
-				}
+			if _, err := s.processProposalBatchLocked(buildProposalBatch(append(p1, p2...))); err != nil {
+				t.Fatal(err)
 			}
 			s.OnDaveMLSProposals(buildRevokeBatch(nil))
 			if cb.commits != 1 {

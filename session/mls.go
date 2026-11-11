@@ -459,6 +459,9 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 	if end > len(payload) {
 		return false, fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
 	}
+	if end != len(payload) {
+		return false, fmt.Errorf("trailing bytes after proposals vector: %d", len(payload)-end)
+	}
 
 	s.logger.Debug("proposals vector parsed",
 		"vec_len", vecLen,
@@ -466,27 +469,15 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 		"payload_first_32", fmt.Sprintf("%x", payload[:minInt(32, len(payload))]),
 		"vector_first_32", fmt.Sprintf("%x", payload[headerSize:minInt(headerSize+32, end)]))
 
-	remaining := payload[headerSize:end]
+	// Frame the entire vector before changing the proposal cache. In particular,
+	// a truncated later message must not leave an earlier proposal staged.
+	items, err := parseAppendProposalMessages(payload[headerSize:end])
+	if err != nil {
+		return false, err
+	}
 	acceptedAny := false
-	for i := 0; len(remaining) > 0; i++ {
-		if len(remaining) < 4 {
-			return acceptedAny, fmt.Errorf("%w: %d bytes", ErrProposalTooShort, len(remaining))
-		}
-		wireOriginal := remaining
-		s.logger.Debug("parsing proposal",
-			"index", i,
-			"remaining_bytes", len(remaining),
-			"wire_hex", fmt.Sprintf("%x", remaining[:minInt(64, len(remaining))]))
-
-		msg, err := framing.UnmarshalMLSMessage(remaining)
-		if err != nil {
-			return acceptedAny, fmt.Errorf("parse proposal message: %w", err)
-		}
-
-		wire := msg.Marshal()
-		if len(wire) == 0 {
-			return acceptedAny, ErrEmptyProposal
-		}
+	for i, item := range items {
+		msg := item.message
 
 		allowed, err := s.proposalAllowedByDAVELocked(msg)
 		if err != nil {
@@ -495,7 +486,6 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 			s.logger.Warn("processProposalBatchLocked: rejecting proposal that failed inspection",
 				"error", err,
 				"index", i)
-			remaining = remaining[len(wire):]
 
 			continue
 		}
@@ -503,7 +493,6 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 			s.stats.ProposalsRejected++
 			s.logger.Warn("processProposalBatchLocked: rejecting disallowed proposal sender/type",
 				"index", i)
-			remaining = remaining[len(wire):]
 
 			continue
 		}
@@ -521,7 +510,6 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 			s.logger.Warn("processProposalBatchLocked: rejecting proposal that failed inspection",
 				"error", err,
 				"index", i)
-			remaining = remaining[len(wire):]
 
 			continue
 		}
@@ -531,23 +519,42 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 				s.logger.Warn("processProposalBatchLocked: ignoring add proposal for unexpected user",
 					"user_id", userID,
 					"index", i)
-				remaining = remaining[len(wire):]
 
 				continue
 			}
 		}
 
 		// Use original bytes (not re-marshaled) so ProposalRef hash matches gateway's computation.
-		if err := s.mlsClient.client.ProcessPublicMessage(context.Background(), s.groupID, wireOriginal[:len(wire)]); err != nil {
+		if err := s.mlsClient.client.ProcessPublicMessage(context.Background(), s.groupID, item.wire); err != nil {
 			return acceptedAny, fmt.Errorf("process proposal public message: %w", err)
 		}
 		acceptedAny = true
-		remaining = remaining[len(wire):]
 	}
 
 	s.logger.Debug("processProposalBatchLocked: all proposals processed successfully")
 
 	return acceptedAny, nil
+}
+
+type appendProposalMessage struct {
+	message *framing.MLSMessage
+	wire    []byte
+}
+
+func parseAppendProposalMessages(data []byte) ([]appendProposalMessage, error) {
+	var items []appendProposalMessage
+	for len(data) > 0 {
+		msg, consumed, err := framing.UnmarshalMLSProposalPrefix(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse proposal message %d: %w", len(items), err)
+		}
+		if consumed <= 0 || consumed > len(data) {
+			return nil, ErrEmptyProposal
+		}
+		items = append(items, appendProposalMessage{message: msg, wire: data[:consumed]})
+		data = data[consumed:]
+	}
+	return items, nil
 }
 
 func (s *Session) proposalAllowedByDAVELocked(msg *framing.MLSMessage) (bool, error) {

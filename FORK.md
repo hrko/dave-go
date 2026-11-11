@@ -33,12 +33,25 @@ checks, malformed input checks and diagnostic tests. Local peers alone do not
 prove Discord or official libdave interoperability. Never log MLS messages,
 KeyPackages, private state, credentials or key material in an integrator.
 
-An additional dependency issue remains: mls-go v1.6.0 framing expects the end of
-the input after the authentication tail and can reject a concatenated append
-batch containing two valid Add proposals. The revoke tests seed that cache with
-separate messages to test revoke independently. Fixing the MLS streaming decoder
-and adding official multi-message differential tests is separate follow-up work;
-do not claim all protocol defects or the live readiness timeout are resolved.
+Concatenated append batches now use the deterministic public-Proposal prefix API
+from hrko/mls-go `634fb81d9a189dcbf4eed3b8148e816b5a9767f0`, based on unreleased
+upstream `20ed0bb`. The exact received bytes are passed to MLS authentication;
+re-marshalling is not used to infer a message boundary. Entire-batch framing is
+checked before staging any proposals; invalid outer lengths and truncated later
+messages are rejected. Authentication/policy processing remains sequential, not
+an all-or-nothing transaction for otherwise well-framed messages.
+
+Consumers MUST repeat the mls-go replace directive in their main module: Go does
+not inherit this module's replacements. Tests cover both joiners in the resulting
+pending epoch, revoke/recommit, bad signatures, and unchanged state on malformed
+batch framing. Official libdave 1.1.0/cpp and this fork both produced commit/welcome
+for the same two-Add batch in an integration test. The existing common-Welcome
+media interoperability tests also pass; this is not full competing-commit/revoke
+differential coverage or proof that the live readiness timeout is resolved.
+
+The new upstream MLS base passes the DAVE suite (including shuffled repeats).
+Its Windows file-store directory Sync tests fail on unmodified upstream as well;
+AsterinMusic uses the memory store. See the MLS fork's FORK.md for scope/limits.
 
 Keep changes small and accompanied by protocol references and regression tests.
 Do not replace MLS cryptography as part of state-management cleanup. If further

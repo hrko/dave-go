@@ -11,3 +11,5 @@ require (
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
+
+replace github.com/thomas-vilte/mls-go => github.com/hrko/mls-go v1.6.1-0.20261111020018-634fb81d9a18
